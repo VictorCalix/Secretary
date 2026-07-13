@@ -1,0 +1,194 @@
+export default {
+  async fetch(request, env) {
+    try {
+      if (request.method !== "POST") {
+        return Response.json(
+          { error: "Método no permitido. Usa POST." },
+          { status: 405 }
+        );
+      }
+
+      const apiKey = request.headers.get("x-api-key");
+
+      if (!env.WORKER_SECRET || apiKey !== env.WORKER_SECRET) {
+        return Response.json(
+          { error: "No autorizado" },
+          { status: 401 }
+        );
+      }
+
+      const body = await request.json();
+
+      const audioBase64 = body.audio_base64;
+      const mimeType = body.mime_type || "audio/ogg";
+      const today = body.today || new Date().toISOString().slice(0, 10);
+
+      if (!audioBase64) {
+        return Response.json(
+          { error: "Falta audio_base64" },
+          { status: 400 }
+        );
+      }
+
+      // Día de la semana en español para dar más contexto al modelo
+      // al resolver fechas relativas ("mañana", "el lunes", etc.)
+      const diasSemana = [
+        "domingo", "lunes", "martes", "miércoles",
+        "jueves", "viernes", "sábado"
+      ];
+      const fechaHoy = new Date(today + "T12:00:00");
+      const nombreDia = diasSemana[fechaHoy.getUTCDay()];
+      const hoyConDia = `${today} (${nombreDia})`;
+
+      // Tabla de referencia de los próximos 14 días, calculada en JS (no en la IA)
+      // para que el modelo solo tenga que "buscar" la fecha en vez de sumar días mentalmente.
+      // Esto mejora mucho la precisión con frases como "en 3 días", "la próxima semana", "el próximo martes".
+      const etiquetas = { 0: "hoy", 1: "mañana", 2: "pasado mañana" };
+      let tablaFechas = "";
+      for (let i = 0; i <= 14; i++) {
+        const f = new Date(fechaHoy);
+        f.setUTCDate(f.getUTCDate() + i);
+        const fStr = f.toISOString().slice(0, 10);
+        const dia = diasSemana[f.getUTCDay()];
+        const etiqueta = etiquetas[i] ? ` = ${etiquetas[i]}` : (i > 0 ? ` = en ${i} días` : "");
+        tablaFechas += `${fStr} (${dia})${etiqueta}\n`;
+      }
+
+      // Anclas semanales (1 a 10 semanas) y mensuales (1 a 6 meses), calculadas en JS
+      // para cubrir expresiones como "en 3 semanas", "en 10 semanas" o "en 2 meses"
+      // sin que el modelo tenga que sumar días grandes manualmente.
+      let tablaSemanas = "";
+      for (let n = 1; n <= 10; n++) {
+        const f = new Date(fechaHoy);
+        f.setUTCDate(f.getUTCDate() + 7 * n);
+        const fStr = f.toISOString().slice(0, 10);
+        const dia = diasSemana[f.getUTCDay()];
+        const etiqueta = n === 1 ? "en 1 semana / la próxima semana" : `en ${n} semanas`;
+        tablaSemanas += `${fStr} (${dia}) = ${etiqueta}\n`;
+      }
+
+      let tablaMeses = "";
+      for (let n = 1; n <= 6; n++) {
+        const f = new Date(fechaHoy);
+        f.setUTCMonth(f.getUTCMonth() + n);
+        const fStr = f.toISOString().slice(0, 10);
+        const dia = diasSemana[f.getUTCDay()];
+        const etiqueta = n === 1 ? "en 1 mes / el próximo mes" : `en ${n} meses`;
+        tablaMeses += `${fStr} (${dia}) = ${etiqueta}\n`;
+      }
+
+      // 1. Transcribir el audio con Whisper
+      const transcription = await env.AI.run(
+        "@cf/openai/whisper-large-v3-turbo",
+        {
+          audio: audioBase64,
+          language: "es",
+          task: "transcribe"
+        }
+      );
+
+      const texto = transcription.text || "";
+
+      if (!texto.trim()) {
+        return Response.json({
+          tareas: [],
+          texto_transcrito: "",
+          aviso: "No se detectó texto en el audio."
+        });
+      }
+
+      // 2. Convertir el texto transcrito a JSON de tareas
+      const llmResult = await env.AI.run(
+        "@cf/meta/llama-3.1-8b-instruct-fast",
+        {
+          messages: [
+            {
+              role: "system",
+              content:
+                "Eres un asistente que extrae tareas y pendientes reales a partir de audios transcritos en español " +
+                "(pueden incluir muletillas, repeticiones o forma de hablar informal/hondureña). " +
+                "Tu trabajo es identificar SOLO las tareas accionables que la persona realmente quiso dejar anotadas, " +
+                "ignorando saludos, ruido o comentarios sin acción. Devuelve únicamente JSON válido según el esquema solicitado, " +
+                "sin explicaciones ni texto adicional."
+            },
+            {
+              role: "user",
+              content:
+                `Hoy es ${hoyConDia}. Aquí tienes tablas de referencia con fechas ya calculadas:\n\n` +
+                `Próximos 14 días:\n${tablaFechas}\n` +
+                `Anclas por semana:\n${tablaSemanas}\n` +
+                `Anclas por mes:\n${tablaMeses}\n` +
+                `Texto transcrito del audio: "${texto}". ` +
+                `Instrucciones:\n` +
+                `1. Identifica cada tarea o pendiente mencionado por separado. No inventes tareas que no se dijeron.\n` +
+                `2. Redacta cada título de forma clara y accionable (verbo + objeto), limpiando muletillas, ` +
+                `pero sin agregar información que no esté en el audio.\n` +
+                `3. Fechas:\n` +
+                `   - "fecha_inicio" SIEMPRE debe tener un valor. Si NO se menciona ninguna fecha ni referencia temporal ` +
+                `para una tarea, usa la fecha de hoy (${today}) como "fecha_inicio".\n` +
+                `   - Si se menciona UNA sola fecha o referencia temporal, esa va en "fecha_inicio" en vez de la fecha de hoy. ` +
+                `Para convertirla a YYYY-MM-DD, NO calcules sumas de días manualmente: busca la expresión en las tablas de arriba. ` +
+                `Usa la tabla de "Próximos 14 días" para cosas como "mañana", "el lunes", "en 3 días"; ` +
+                `la tabla de "Anclas por semana" para "en N semanas" o "la próxima semana"; ` +
+                `y la tabla de "Anclas por mes" para "en N meses" o "el próximo mes".\n` +
+                `   - SOLO llena "fecha_fin" si se menciona explícitamente un plazo o entrega distinto a la fecha de inicio ` +
+                `(ej. "empezar el lunes y entregarlo en 2 semanas").\n` +
+                `   - Si una referencia temporal no aparece en ninguna tabla (ej. "en un año"), calcúlala tomando como base ${today}.\n` +
+                `4. Si no hay tareas reales en el texto (solo saludos, ruido, o comentarios sin acción), devuelve {"tareas":[]}.`
+            }
+          ],
+          temperature: 0.1,
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              type: "object",
+              properties: {
+                tareas: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    properties: {
+                      titulo: { type: "string" },
+                      fecha_inicio: { type: "string" },
+                      fecha_fin: { type: "string" }
+                    },
+                    required: ["titulo", "fecha_inicio", "fecha_fin"]
+                  }
+                }
+              },
+              required: ["tareas"]
+            }
+          }
+        }
+      );
+
+      let respuestaFinal = llmResult.response || llmResult;
+
+      if (typeof respuestaFinal === "string") {
+        try {
+          respuestaFinal = JSON.parse(respuestaFinal);
+        } catch (e) {
+          respuestaFinal = {
+            tareas: [],
+            error: "El modelo no devolvió JSON válido.",
+            respuesta_modelo: respuestaFinal
+          };
+        }
+      }
+
+      return Response.json({
+        ...respuestaFinal,
+        texto_transcrito: texto
+      });
+
+    } catch (error) {
+      return Response.json(
+        {
+          error: "Error interno en el Worker",
+          detalle: String(error.message || error)
+        },
+        { status: 500 }
+      );
+    }
+  }
+};
